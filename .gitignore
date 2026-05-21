@@ -8,3 +8,6 @@ data/
 *.db
 .vscode/
 .idea/
+Planning/
+Alphatesting
+scratch_test.py
