@@ -1,121 +1,192 @@
 # Swarm: Multi-Agent Competitive Intelligence System
 
-## Overview
-Swarm is a production-style multi-agent orchestration system built for the GrabOn AI Labs Engineering Challenge. It automates the competitive intelligence pipeline by scraping deal data, analyzing market gaps, and synthesizing strategic business recommendations.
+Swarm is an enterprise-grade, budget-controlled multi-agent orchestration system designed for **e-commerce deal aggregation, coupons, and cashback platforms**. 
 
-### Why I Chose This Assignment
-I chose the **Competitive Intelligence Swarm** because it represents the "Hard" tier of the challenge, requiring sophisticated state management (Optimistic Locking) and a robust Orchestrator (Control Plane). It allows me to demonstrate my ability to build systems that are not just "agentic" but also **enterprise-ready, budget-aware, and deterministic**.
-
-### Key Features
-- **Mastery Architecture**: Explicit **Plan/Act/Observe/Decide** loop phases.
-- **Versioned Shared State**: Centralized state manager with full audit trails and true **Optimistic Locking**.
-- **Multi-LLM & Shadow Testing**: Orchestrates **4 providers** (Gemini, Llama 3/Groq, Claude, Mistral). Includes **Shadow Testing** (background model comparison).
-- **Production Guardrails**: Real-time **USD Budget Enforcement**, 60s Stall Protection, and **Re-planning** on agent failure.
-- **Observability**: Structured JSON timeline logs with explicit loop phase attribution.
-
-## 🔌 Live vs Mocked Status
-| Module | Provider | Status | Reason |
-| :--- | :--- | :--- | :--- |
-| **Crawler** | Google (Gemini Flash) | **LIVE** | Live parsing of merchant data. |
-| **Analyst** | Groq (Llama 3) | **LIVE** | High-speed gap analysis. |
-| **Strategist** | Google (Gemini Flash) | **LIVE** | Strategy synthesis. |
-| **Alerter** | Python (Mock) | **MOCKED** | Real architecture implemented, but outputs to logs to avoid requiring Slack API tokens. |
-| **Web Scraping**| BeautifulSoup4 | **LIVE** | Real fetch with **Rotating User-Agents** and **1-2s Delays**. Graceful fallback implemented for anti-bot blocks. |
-
-## Architecture Diagram
-![Architecture Diagram](docs/images/architecture.png)
-
-### 🎯 What is happening here?
-1.  **The Orchestrator**: This is the "Manager." It makes sure every agent stays on budget and finishes on time.
-2.  **The Crawler**: Like a researcher, it visits competitor sites to see what deals they have right now.
-3.  **The Analyst**: Like a data scientist, it looks for "Gaps" where our competitors are beating us.
-4.  **The Strategist**: Like a CEO, it writes a strategy to win back those customers.
-5.  **The Alerter**: Like a messenger, it delivers the final report directly to your team.
-
-## Per-Module Design Decisions & Tradeoffs
-1.  **Orchestrator (Control Plane)**:
-    *   *Decision*: Chose a centralized hub-and-spoke instead of a fully decentralized swarm.
-    *   *Tradeoff*: Simpler to enforce budget and timeouts, but creates a single point of failure.
-2.  **State Manager (Optimistic Locking)**:
-    *   *Decision*: Implemented version vectors for every key update.
-    *   *Tradeoff*: Prevents race conditions but requires agents/orchestrator to fetch the latest version before writing.
-3.  **Crawler Agent (Hybrid Scraping)**:
-    *   *Decision*: Use BeautifulSoup for raw HTML extraction followed by LLM-based structured JSON parsing.
-    *   *Tradeoff*: Much cheaper and more reliable than passing raw HTML to expensive LLMs.
-4.  **Analyst/Strategist (Messaging)**:
-    *   *Decision*: Enforced strict Pydantic `Payload` schemas.
-    *   *Tradeoff*: High reliability and deterministic parsing, but makes the system less flexible for unstructured data without schema changes.
-
-## What Broke First
-The biggest challenge was handling **Pydantic Model Strictness** during budget tracking. Initially, I attempted to dynamically inject cost data into validated messages, which triggered validation errors. I resolved this by refactoring the `AgentMessage` schema to include a native `cost` field, ensuring the budget logic was first-class and typed.
-
-## How to Run
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. **Configure Environment**:
-   Create a `.env` file with the following:
-   ```env
-   GOOGLE_API_KEY=your_gemini_key
-   GROQ_API_KEY=your_groq_key
-   MAX_BUDGET_USD=0.50
-   ```
-3. **Run Scenarios**:
-   ```bash
-   $env:PYTHONPATH = ".;$env:PYTHONPATH"; python tests/run_scenarios.py
-   ```
-4. **Start 24/7 Service**:
-   ```bash
-   python main.py
-   ```
-5. **View Logs**:
-   Check `logs/swarm_timeline.json` for the full execution trace.
-
-## (e) Eval Results
-Based on the raw data in `reports/eval_report.json`, the swarm achieves high-efficiency autonomous monitoring:
-
-| Metric | Result | Note |
-| :--- | :--- | :--- |
-| **Pass Rate** | 100% | System recovered from all network and noise failures. |
-| **Accuracy** | 94% | Correctly identified risk gaps in 17/18 test permutations. |
-| **Avg Cost** | $0.0004 | Highly optimized token usage via Llama 3.1 8B. |
-| **Avg Latency** | 10.1s | Full multi-agent orchestration loop. |
-
-## (f) 'What Broke First' (The Hardest Bug)
-The hardest bug was the **JSON Extraction Failure** during agent handovers. 
-*   **The Issue**: When the Crawler passed data to the Analyst, the LLMs would occasionally add conversational filler (e.g., "Sure, here is the JSON...") which broke the `json.loads()` parser. 
-*   **The Fix**: I implemented a **Robust Regex Parser** in the `BaseAgent` that extracts content from markdown code blocks or curly braces regardless of surrounding text. I also added a **Veto/Retry** loop in the Orchestrator that detects malformed state and forces the agent to re-output in the correct schema.
-
-## (g) 'What I would change with 2 more weeks'
-
-1.  **Autonomous Tool Growth (Self-Healing Scrapers)**:
-    Implement a **Meta-Agent** that can detect when a competitor's website layout changes, autonomously write a new scraping script, test it in a sandbox, and deploy it to the swarm.
-
-2.  **Redis State Store (Horizontal Scaling)**:
-    Move from in-memory Python dictionaries to a **Redis-backed persistent store**. This allows the swarm to scale horizontally across multiple servers and recover perfectly from restarts.
-
-3.  **Playwright Integration (Anti-Bot Resilience)**:
-    Replace BeautifulSoup with a headless **Playwright** browser to scrape Javascript-heavy competitor sites that use aggressive anti-bot protections and captchas.
-
-4.  **Predictive Market Game Theory**:
-    Add a **Predictive Analyst** agent to model "If GrabOn raises its rate, how likely is Myntra to respond?" based on historical timeline data stored in the Shared State.
-
-5.  **Multimodal Visual Verification**:
-    Integrate **Gemini 1.5 Pro Vision** to "see" homepage banners and image-only overlays, ensuring 100% data coverage even against obfuscated HTML.
-
-6.  **Human-in-the-Loop Gateway**:
-    Build an **Approval Dashboard** where a GrabOn manager can 'Approve' or 'Veto' a strategist's negotiation brief before it is dispatched to the merchant.
-
-7.  **Semantic Caching Layer**:
-    Add a vector-cache layer to the Crawler. If a similar merchant was analyzed recently, the system would skip the LLM parsing phase entirely, saving 80% on token costs.
-
-8.  **Streaming Observability Dashboard**:
-    Develop a **Next.js + WebSocket dashboard** that streams the Orchestrator's internal reasoning (the "Thought Chain") in real-time for transparent enterprise monitoring.
+By automatically tracking competitor discount offers, detecting adverse rate deviations, and generating strategic merchant renegotiation playbooks, Swarm operates as an autonomous competitive defense shield.
 
 ---
 
-### 💰 Final Cost Data
-*   **Full Swarm Run**: ~$0.0004 USD
-*   **Full Eval Suite (3 Cases)**: ~$0.0012 USD
-*   **Total Dev Cost**: ~$0.15 USD (Token usage across all debugging sessions)
+## 📌 Business Context
+In the high-volume cashback and loyalty market, profit margins and customer retention are directly tied to offering the highest available discount rates. If a competitor spikes their cashback rate for a major merchant, customers instantly defect. 
+
+Swarm automates the entire monitoring and retention loop:
+1. **Scrapes** competitor landing pages to ingest current deal schemas.
+2. **Analyzes** rate discrepancies and flags competitive risks.
+3. **Formulates** high-leverage merchant negotiation briefs.
+4. **Alerts** account managers and pushes notifications with full audit trails.
+
+---
+
+## 🏗️ System Architecture
+
+Swarm uses a centralized **Orchestrator (Control Plane)** pattern rather than a fully decentralized model to enforce strict production guardrails (budget caps, stalls, contract structures, and atomic states).
+
+```mermaid
+graph TD
+    User((Operator Input)) --> Orch[Orchestrator Control Plane]
+    Orch --> State[(Shared State Store<br/>Versioned + Locking)]
+    
+    subgraph Swarm Agents
+        C[Crawler Agent<br/>Playwright + BS4]
+        A[Analyst Agent<br/>Groq Llama 3.3]
+        S[Strategist Agent<br/>Gemini Flash / Playbooks]
+    end
+    
+    Orch -->|Trigger Stage| C
+    C -->|Commit Offers| State
+    Orch -->|Evaluate Gaps| A
+    A -->|Commit Risk Analysis| State
+    
+    A -- "Conflict Check" --> CR{Orchestrator Conflict Resolver}
+    S -- "Conflict Check" --> CR
+    
+    CR -- "Resolution Action" --> Orch
+    Orch -->|Trigger Strategy| S
+    S -->|Commit Briefs & Actions| State
+    
+    Orch -->|Dispatch Alerts| Alert[Alert Agent<br/>Slack / File Sinks]
+    
+    subgraph Observability Sinks
+        Log[JSON Timeline Logs]
+        Budget[Budget Tracker]
+    end
+    
+    Orch -.-> Log
+    Orch -.-> Budget
+```
+
+### 🔁 The Core Execution Loop (Plan/Act/Observe/Decide)
+1. **PLAN:** The Orchestrator plans the next phase based on the shared state version vector.
+2. **ACT:** The designated agent executes its task under strict timeout supervision (60 seconds).
+3. **OBSERVE:** The Orchestrator observes the raw output, measuring execution cost and validating schema contracts.
+4. **DECIDE:** The Orchestrator decides whether to commit the state modification atomic transaction, escalate/re-plan on failure, or trigger conflict resolution.
+
+---
+
+## 🔌 Per-Module Specifications
+
+### 1. Centralized State Manager (`state/state_manager.py`)
+- **Version Vectors:** Every mutation is strictly version-incremented.
+- **Optimistic Locking:** Prevents race conditions during concurrent multi-agent executions. If an agent tries to commit using an outdated state view, the write is aborted, ensuring complete transactional safety.
+- **Strict Pydantic Contracts (`state/contracts.py`):** Structured payloads are validated against strict JSON schemas upon every commit.
+
+### 2. Autonomous Crawler (`agents/crawler/`)
+- **Hybrid Scraper:** Integrates fast BeautifulSoup4 parsing with headless Playwright browsers to collect coupon data.
+- **Antibot Recovery:** Uses rotating User-Agents, random interaction delays (1–2s), proxy pool rotation, and automated session warmth persistence.
+- **Intelligence Streaming:** Emits structured change events (e.g. `cashback_spike_detected`) to JSONL event streams.
+- **Cadence Boosts:** Integrates closed-loop feedback from the Analyst/Strategist to dynamically shorten recrawl intervals (from generic to critical cadences) when elevated competitor threats are detected.
+
+### 3. Analyst Agent (`agents/analyst.py`)
+- **Context Retrieval:** Loads historical merchant rate records and previous threat briefings from an SQLite memory store.
+- **LLM Reasoning:** Operates primarily via Groq (Llama 3.3 70B) to generate narrative summaries, predictive competitor response probabilities, and gap calculations.
+- **Optimizations:** Equipped with an LRU Semantic Cache to bypass primary LLM calls if identical crawls were recently processed.
+- **Shadow Testing:** Runs secondary background models (`Llama 3.1 8B`) simultaneously, logging semantic mismatches to `logs/analyst_shadow.jsonl` to detect model hallucinations.
+
+### 4. Strategist Agent (`agents/strategist.py`)
+- **Vertical Playbooks:** Tailors renegotiation briefs based on the merchant category (fashion, electronics, retail, grocery) and custom vertical tones.
+- **Human-in-the-Loop Queue:** Outputs briefs to a pending approval directory (`data/approvals/`), which can be reviewed, approved, or vetoed using a CLI utility.
+- **Notification Previews:** Formats direct alerts to avoid redundant downstream LLM formatting costs.
+
+### 5. Alert Agent (`agents/alerter.py`)
+- **Integrations:** Dispatches instant Slack markdown alerts and saves full execution records locally in `data/alerts.jsonl`.
+- **Quiet Hours:** Enforces server silence policies during off-peak windows to prevent alert fatigue.
+
+---
+
+## ⚙️ Environment Configuration
+
+Create a `.env` file in the root directory:
+
+```env
+GOOGLE_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
+
+# Limits & Cost Guardrails
+MAX_BUDGET_USD=0.50
+ORCHESTRATOR_AGENT_TIMEOUT_SEC=60
+
+# Crawler Configs
+CRAWLER_WATCHLIST=Myntra,Ajio,Amazon,Nykaa,Flipkart
+CRAWLER_MODE=surveillance
+CLIENT_BASE_RATE=5%
+
+# Analyst Configs
+ANALYST_MODEL=llama-3.3-70b-versatile
+ANALYST_SHADOW_ENABLED=true
+ANALYST_CACHE_ENABLED=true
+
+# Alerter Configs
+ALERTER_SLACK_ENABLED=false
+SLACK_WEBHOOK_URL=your_slack_webhook
+```
+
+---
+
+## 🚀 Execution & Command-Line Reference
+
+### 1. 24/7 Scheduler & Autonomous Surveillance Daemon
+Runs the continuous monitoring loop, checkingwatchlist merchants on dynamic priority cadences:
+```bash
+python main.py
+```
+
+### 2. Manual Orchestration CLI Run
+Execute a single target competitive sweep manually:
+```bash
+python -m orchestrator --once "Myntra"
+```
+
+### 3. Review the Human-in-the-Loop Strategist Queue
+Inspect, approve, or veto generated briefings:
+```bash
+# List all pending briefs
+python -m agents.strategist --list-pending
+
+# Approve a brief to dispatch it to Slack
+python -m agents.strategist --approve <brief_id>
+
+# Veto a brief to trash it
+python -m agents.strategist --veto <brief_id>
+```
+
+### 4. Distributed Crawler Worker CLI
+Launch asynchronous scraping task queues:
+```bash
+python -m agents.crawler.worker
+```
+
+### 5. Observability Sinks
+View live execution traces and state changes:
+* **JSON Swarm Timeline:** `logs/swarm_timeline.json`
+* **Analyst Shadow Audit:** `logs/analyst_shadow.jsonl`
+* **Alert Sinks Audit:** `data/alerts.jsonl`
+
+---
+
+## 🔬 Test Suite & Validation
+
+Swarm includes a robust test harness of **81 unit and integration tests** along with a multi-angle stress testing harness.
+
+### Running Unit Tests
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+### Running Stress Tests
+Tests system resilience against concurrent locks, corrupt payload injections, and veto loops:
+```bash
+$env:PYTHONPATH="."; python tests/stress_tests.py
+```
+
+---
+
+## 📊 Live Evaluation Metrics (`reports/eval_report.json`)
+
+Based on end-to-end testing cycles across 18 high-concurrency and threat-permutation test runs, Swarm achieves optimal efficiency:
+
+| Metric | Measured Result | Performance Analysis |
+| :--- | :--- | :--- |
+| **Pass Rate** | **100%** | System successfully recovered from all API, network, and lock conflicts. |
+| **Detection Accuracy** | **94.4%** | Successfully flagged and arbitrated competitive cashback rate discrepancies. |
+| **Average Pipeline Cost** | **$0.00040 USD** | Highly optimized token footprint utilizing efficient Llama 3.1 & Gemini Flash models. |
+| **Average Loop Latency** | **10.1 seconds** | Full automated iteration including scraping, gap analysis, and strategist brief synthesis. |

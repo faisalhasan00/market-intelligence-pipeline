@@ -59,16 +59,18 @@ class BaseAgent(ABC):
         """
         import os
         import asyncio
+
+        model_name = (model_name or self.model_name or "").strip()
+        if not model_name:
+            return "Error: No model configured", 0.0
         
         try:
             if "gemini" in model_name:
                 import google.generativeai as genai
                 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
                 model = genai.GenerativeModel(model_name)
-                response = await asyncio.to_thread(model.generate_content, prompt)
                 
-                
-                # Retry logic for rate limits
+                last_error = None
                 for attempt in range(3):
                     try:
                         response = await asyncio.to_thread(model.generate_content, prompt)
@@ -77,33 +79,56 @@ class BaseAgent(ABC):
                         cost = self.calculate_cost(in_tokens, out_tokens, model_name)
                         return response.text, cost
                     except Exception as e:
+                        last_error = e
                         if "429" in str(e) or "quota" in str(e).lower():
                             await asyncio.sleep(2 ** (attempt + 1))
                             continue
                         raise e
+                if last_error:
+                    raise last_error
 
-            elif "llama" in model_name:
+            elif self.provider == "groq" or "llama" in model_name.lower() or "mixtral" in model_name.lower() or "gemma" in model_name.lower():
                 from groq import Groq
-                client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                api_key = os.getenv("GROQ_API_KEY")
+                if not api_key:
+                    return "Error: GROQ_API_KEY not set", 0.0
+                client = Groq(api_key=api_key)
                 
-                for attempt in range(3):
-                    try:
-                        response = await asyncio.to_thread(
-                            client.chat.completions.create,
-                            messages=[{"role": "user", "content": prompt}],
-                            model=model_name
-                        )
-                        cost = self.calculate_cost(
-                            response.usage.prompt_tokens, 
-                            response.usage.completion_tokens, 
-                            model_name
-                        )
-                        return response.choices[0].message.content, cost
-                    except Exception as e:
-                        if "429" in str(e) or "quota" in str(e).lower():
-                            await asyncio.sleep(2 ** (attempt + 1))
-                            continue
-                        raise e
+                fallback_chain = [model_name]
+                if model_name == "llama-3.3-70b-versatile":
+                    fallback_chain.extend(["llama-3.1-8b-instant", "llama-3.2-3b-preview"])
+                elif model_name == "llama-3.1-8b-instant":
+                    fallback_chain.extend(["llama-3.2-3b-preview", "gemma2-9b-it"])
+
+                last_error = None
+                for current_model in fallback_chain:
+                    if current_model != model_name:
+                        print(f"   [LLM Fallback] Falling back to model: {current_model}")
+                    for attempt in range(3):
+                        try:
+                            response = await asyncio.to_thread(
+                                client.chat.completions.create,
+                                messages=[{"role": "user", "content": prompt}],
+                                model=current_model
+                            )
+                            cost = self.calculate_cost(
+                                response.usage.prompt_tokens, 
+                                response.usage.completion_tokens, 
+                                current_model
+                            )
+                            return response.choices[0].message.content, cost
+                        except Exception as e:
+                            last_error = e
+                            error_str = str(e).lower()
+                            if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
+                                if attempt < 2:
+                                    await asyncio.sleep(2 ** (attempt + 1))
+                                continue
+                            raise e
+                    print(f"   [LLM Warning] Groq model {current_model} rate-limited. Trying next fallback...")
+                
+                if last_error:
+                    raise last_error
 
             elif "claude" in model_name:
                 # If key is missing, return a mocked response as per rules
@@ -133,7 +158,7 @@ class BaseAgent(ABC):
                 # Local is free
                 return response.json().get("response", ""), 0.0
 
-            return "Error: Unsupported model", 0.0
+            return f"Error: Unsupported model '{model_name}' (provider: '{self.provider}')", 0.0
         except Exception as e:
             print(f"[{self.role}] LLM Error: {e}")
             return f"Error: {str(e)}", 0.0
@@ -142,6 +167,10 @@ class BaseAgent(ABC):
         """
         Robustly extracts JSON from LLM responses even if surrounded by text or markdown.
         """
+        if not text or text.strip().startswith("Error:"):
+            if text and text.strip().startswith("Error:"):
+                print(f"   [{self.role}] LLM skipped: {text.strip()[:120]}")
+            return {}
         try:
             # 1. Try to find JSON inside markdown code blocks
             json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)

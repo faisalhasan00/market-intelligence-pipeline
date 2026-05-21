@@ -22,6 +22,7 @@ from agents.crawler.intelligence.intent import IntentDetector
 from agents.crawler.intelligence.lifecycle import OfferLifecycleTracker
 from agents.crawler.intelligence.streaming import IntelligenceStream, get_intelligence_stream
 from agents.crawler.intelligence.sweep import MarketSweep
+from agents.crawler.extraction.evidence_validator import EvidenceValidator
 from agents.crawler.platform.memory import CrawlerMemory
 from agents.crawler.platform.store import IntelligenceStore
 
@@ -40,6 +41,7 @@ class IntelligenceHub:
         self.lifecycle = OfferLifecycleTracker(store)
         self.intent = IntentDetector()
         self.sweep = MarketSweep(store)
+        self.evidence = EvidenceValidator()
 
     async def process(
         self,
@@ -48,6 +50,7 @@ class IntelligenceHub:
         *,
         raw_texts: Optional[Dict[str, str]] = None,
         parser_events: Optional[List[Dict[str, Any]]] = None,
+        crawl_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         parser_events = list(parser_events or [])
         all_events: List[Dict[str, Any]] = list(parser_events)
@@ -60,6 +63,18 @@ class IntelligenceHub:
                 **c,
             })
 
+        evidence_events, evidence_summary = self.evidence.validate(
+            merchant_slug,
+            sources,
+            consensus,
+            crawl_mode=crawl_mode,
+        )
+        all_events.extend(evidence_events)
+        if evidence_summary.get("downgraded_sources"):
+            for s in sources:
+                if s.get("requires_revalidation"):
+                    consensus = self.consensus.validate(sources)
+
         anomaly_report = self.anomaly.analyze(
             merchant_slug,
             sources,
@@ -70,7 +85,10 @@ class IntelligenceHub:
         all_events.extend(
             detect_events(merchant_slug, sources, self.store, raw_texts=raw_texts)
         )
-        all_events.extend(self.lifecycle.update(merchant_slug, sources))
+        warmup = not self.store.has_baseline(merchant_slug)
+        all_events.extend(
+            self.lifecycle.update(merchant_slug, sources, warmup=warmup)
+        )
 
         intent_signals = self.intent.detect(merchant_slug, sources, all_events)
         all_events.extend(intent_signals)
@@ -93,6 +111,7 @@ class IntelligenceHub:
         return {
             "events": all_events,
             "consensus": consensus,
+            "evidence_validation": evidence_summary,
             "anomaly": anomaly_report,
             "category": cat.name,
             "category_profile": {

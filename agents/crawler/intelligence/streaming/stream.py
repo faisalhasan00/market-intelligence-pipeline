@@ -48,4 +48,7 @@ def get_intelligence_stream() -> IntelligenceStream:
     global _default_stream
     if _default_stream is None:
         _default_stream = IntelligenceStream()
+        from agents.crawler.intelligence.streaming.sinks import configure_stream_sinks
+
+        configure_stream_sinks(_default_stream)
     return _default_stream

@@ -10,6 +10,7 @@ from agents.crawler.platform.memory import CrawlerMemory
 from agents.crawler.crawl.self_healing import extract_with_healing
 from agents.crawler.crawl.profiles import CrawlTarget
 from agents.crawler.platform.store import IntelligenceStore
+from agents.crawler.crawl.navigation import discover_campaign_urls
 from agents.crawler.crawl.visual_intelligence import analyze_screenshot, should_run_visual, vision_enabled
 
 GREEN = "\033[92m"
@@ -28,7 +29,32 @@ async def process_target(
 ) -> Tuple[Dict[str, Any], float]:
     """Returns (source_record, cost_usd)."""
     cost = 0.0
-    snap: PageSnapshot = await collector.fetch(target.source_name, target.url)
+    antibot = getattr(agent, "antibot", None)
+    if antibot and antibot.should_skip(target.source_name):
+        return _cooldown_record(target, merchant_name, merchant_slug), 0.0
+
+    snap: PageSnapshot = await collector.fetch(
+        target.source_name, target.url, merchant_slug=merchant_slug
+    )
+    if snap.blocked and antibot:
+        snap = await antibot.try_recover(
+            collector,
+            source_name=target.source_name,
+            url=target.url,
+            snap=snap,
+            merchant_slug=merchant_slug,
+        )
+
+    if getattr(agent, "_follow_links", False) and snap.html and not snap.blocked:
+        snap, nav_cost = await _enrich_with_campaign_pages(
+            agent,
+            collector,
+            antibot,
+            snap,
+            target,
+            merchant_slug,
+        )
+        cost += nav_cost
 
     if snap.blocked and snap.error and "captcha" in (snap.raw_text or "").lower():
         store.insert_events(merchant_slug, [{
@@ -48,14 +74,21 @@ async def process_target(
         raw_text=snap.raw_text,
         html=snap.html,
     )
-    extracted, llm_cost = await maybe_llm_extract(
-        agent,
-        raw_text=snap.raw_text,
-        url=snap.url,
-        merchant=merchant_name,
-        source_name=target.source_name,
-        deterministic_result=extracted,
-    )
+    budget = getattr(agent, "budget", None)
+    llm_cost = 0.0
+    if budget is None or budget.can_use_llm():
+        extracted, llm_cost = await maybe_llm_extract(
+            agent,
+            raw_text=snap.raw_text,
+            url=snap.url,
+            merchant=merchant_name,
+            source_name=target.source_name,
+            deterministic_result=extracted,
+        )
+        if budget and llm_cost > 0:
+            budget.record_llm()
+    elif budget and budget.should_conserve():
+        print(f"   [Budget] LLM skipped for {target.source_name}")
     cost += llm_cost
 
     offers: List[str] = list(extracted.get("offers") or [])
@@ -63,7 +96,16 @@ async def process_target(
     visual_events: List[Dict[str, Any]] = []
     visual_intel: Dict[str, Any] = {}
 
-    if snap.evidence and vision_enabled() and should_run_visual(dom_offer_count=len(offers)):
+    run_vision = (
+        snap.evidence
+        and vision_enabled()
+        and should_run_visual(dom_offer_count=len(offers))
+    )
+    if budget is not None and not budget.can_use_vision(merchant_slug):
+        run_vision = False
+        if snap.evidence and vision_enabled():
+            print(f"   [Budget] Vision skipped for {target.source_name}")
+    if run_vision:
         vi, vcost = await analyze_screenshot(
             snap.evidence.path,
             merchant=merchant_name,
@@ -73,6 +115,8 @@ async def process_target(
             previous_hero_phash=prev_snap.get("hero_perceptual_hash"),
         )
         cost += vcost
+        if budget:
+            budget.record_vision(merchant_slug)
         visual_intel = vi.to_dict()
 
         if vi.offers:
@@ -185,3 +229,70 @@ async def process_target(
         print(f"   {YELLOW}! {target.source_name}: empty/blocked{RESET}")
 
     return record, cost
+
+
+def _cooldown_record(
+    target: CrawlTarget,
+    merchant_name: str,
+    merchant_slug: str,
+) -> Dict[str, Any]:
+    return {
+        "source_name": target.source_name,
+        "target_type": target.target_type,
+        "url": target.url,
+        "merchant": merchant_name,
+        "cashback_rate": None,
+        "offers": [],
+        "blocked": True,
+        "extraction": {"method": "skipped", "confidence": 0.0},
+        "status_code": 403,
+        "reliability_score": 0.0,
+        "error": "source_in_cooldown",
+        "_raw_text": "",
+        "_html": "",
+    }
+
+
+async def _enrich_with_campaign_pages(
+    agent,
+    collector: PlaywrightCollector,
+    antibot,
+    snap: PageSnapshot,
+    target: CrawlTarget,
+    merchant_slug: str,
+) -> Tuple[PageSnapshot, float]:
+    extra_cost = 0.0
+    urls = discover_campaign_urls(snap.html, snap.url, merchant_slug)
+    if not urls:
+        return snap, extra_cost
+
+    combined_text = snap.raw_text or ""
+    combined_html = snap.html or ""
+    for campaign_url in urls:
+        print(f"   [Nav] {target.source_name} → {campaign_url[:90]}")
+        csnap = await collector.fetch(
+            target.source_name, campaign_url, merchant_slug=merchant_slug
+        )
+        if csnap.blocked and antibot:
+            csnap = await antibot.try_recover(
+                collector,
+                source_name=target.source_name,
+                url=campaign_url,
+                snap=csnap,
+                merchant_slug=merchant_slug,
+            )
+        if not csnap.blocked:
+            combined_text = f"{combined_text}\n{csnap.raw_text or ''}"
+            combined_html = f"{combined_html}\n{csnap.html or ''}"
+
+    return PageSnapshot(
+        source_name=snap.source_name,
+        url=snap.url,
+        raw_text=combined_text[:12000],
+        status_code=snap.status_code,
+        blocked=snap.blocked,
+        evidence=snap.evidence,
+        html=combined_html[:100000],
+        error=snap.error,
+        proxy_used=snap.proxy_used,
+    ), extra_cost

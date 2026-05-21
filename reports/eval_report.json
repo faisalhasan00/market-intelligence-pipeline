@@ -1,15 +1,15 @@
 [
     {
         "test_case": "High Competition Test",
-        "status": "FAIL",
+        "status": "PASS",
         "metrics": {
-            "latency_sec": 10.48,
-            "cost_usd": 0.000402,
+            "latency_sec": 118.55,
+            "cost_usd": 0.000224,
             "expected_risk": "HIGH",
-            "actual_risk": "UNKNOWN"
+            "actual_risk": "HIGH"
         },
         "audit": {
-            "version": 4,
+            "version": 5,
             "agent_trace": [
                 "competitor_data",
                 "analysis_results",
@@ -27,13 +27,13 @@
         "test_case": "Consensus Test",
         "status": "PASS",
         "metrics": {
-            "latency_sec": 10.43,
-            "cost_usd": 0.000798,
+            "latency_sec": 54.15,
+            "cost_usd": 0.00044,
             "expected_risk": "ANY",
-            "actual_risk": "UNKNOWN"
+            "actual_risk": "MEDIUM"
         },
         "audit": {
-            "version": 8,
+            "version": 10,
             "agent_trace": [
                 "competitor_data",
                 "analysis_results",
@@ -51,13 +51,13 @@
         "test_case": "Veto Recovery Test",
         "status": "PASS",
         "metrics": {
-            "latency_sec": 9.41,
-            "cost_usd": 0.001179,
+            "latency_sec": 54.37,
+            "cost_usd": 0.000617,
             "expected_risk": "UNKNOWN",
             "actual_risk": "UNKNOWN"
         },
         "audit": {
-            "version": 12,
+            "version": 15,
             "agent_trace": [
                 "competitor_data",
                 "analysis_results",

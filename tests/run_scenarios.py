@@ -63,8 +63,8 @@ class SwarmTester:
         
         start_time = time.time()
         try:
-            await orchestrator.run_pipeline(query)
-            status = "PASSED"
+            result = await orchestrator.run_pipeline(query)
+            status = "PASSED" if result.success else f"FAILED: {result.error}"
         except Exception as e:
             print(f"      Captured expected failure: {e}")
             status = f"FAILED: {e}"

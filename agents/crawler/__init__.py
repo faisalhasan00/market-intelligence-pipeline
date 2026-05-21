@@ -12,7 +12,9 @@ Autonomous market intelligence crawler.
 from agents.crawler.agent import CrawlerAgent
 from agents.crawler.intelligence import IntelligenceHub, get_intelligence_stream
 from agents.crawler.scheduling import AdaptiveCrawlPolicy, MarketScheduler
-from agents.crawler.platform import CrawlerMemory, IntelligenceStore
+from agents.crawler.platform import CrawlBudget, CrawlerMemory, IntelligenceStore
+from agents.crawler.platform.registry import MerchantRegistry
+from agents.crawler.surveillance import SurveillanceEngine
 
 __all__ = [
     "CrawlerAgent",
@@ -21,5 +23,8 @@ __all__ = [
     "AdaptiveCrawlPolicy",
     "MarketScheduler",
     "IntelligenceStore",
+    "CrawlBudget",
     "CrawlerMemory",
+    "MerchantRegistry",
+    "SurveillanceEngine",
 ]

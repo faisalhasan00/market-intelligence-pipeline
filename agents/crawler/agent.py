@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 from agents.base_agent import BaseAgent
+from agents.crawler.crawl.antibot import AntibotRecovery
 from agents.crawler.crawl.collector import PlaywrightCollector
 from agents.crawler.extraction.confidence import aggregate_confidence
 from agents.crawler.intelligence import IntelligenceHub, get_intelligence_stream
@@ -28,7 +29,14 @@ from agents.crawler.crawl.profiles import (
 )
 from agents.crawler.crawl.proxy import ProxyPool
 from agents.crawler.crawl.reliability import build_targets_ranked
+from agents.crawler.scheduling.policy import (
+    INTERVAL_CRITICAL,
+    INTERVAL_HOT,
+    CrawlDecision,
+)
 from agents.crawler.scheduling.scheduler import MarketScheduler
+from agents.crawler.surveillance import SurveillanceEngine
+from agents.crawler.platform.budget import CrawlBudget
 from agents.crawler.platform.store import IntelligenceStore
 from agents.crawler.crawl.workers import CrawlWorkerPool
 from messaging.schemas import AgentMessage, AgentRole, MessageType
@@ -36,6 +44,7 @@ from messaging.schemas import AgentMessage, AgentRole, MessageType
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
@@ -59,6 +68,9 @@ class CrawlerAgent(BaseAgent):
         self._radar_worker_id = f"crawler-{uuid.uuid4().hex[:8]}"
         self.stream = get_intelligence_stream()
         self.intelligence = IntelligenceHub(self.store, self.stream)
+        self.budget = CrawlBudget(self.store)
+        self.antibot = AntibotRecovery(self.store, self.proxy_pool)
+        self._follow_links = False
 
     async def handle_request(self, message: AgentMessage) -> AgentMessage:
         payload = message.payload.data
@@ -83,8 +95,21 @@ class CrawlerAgent(BaseAgent):
         """Core collection API — used by orchestrator and autonomous radar."""
         merchant_slug = normalize_query(raw_query)
         merchant_name = merchant_display(merchant_slug)
-        max_competitors = competitor_count_for_run(full_scrape=full_scrape)
+        self.budget.begin_run()
+        plan = self.policy.plan_crawl(
+            merchant_slug,
+            force_full=full_scrape,
+            budget=self.budget,
+        )
+        self._follow_links = plan.follow_links
+        full_scrape = plan.full_scrape
+        max_competitors = self.budget.max_competitors_for_run(full_scrape=full_scrape)
+        schedule_row = self.store.get_merchant_schedule(merchant_slug) or {}
+        crawl_mode = schedule_row.get("crawl_mode") or plan.mode
         started_at = datetime.now(timezone.utc).isoformat()
+
+        if self.budget.should_conserve():
+            print(f"   [Budget] Conserving spend (${self.budget.hourly_spend():.2f}/{self.budget.hourly_limit})")
 
         print(f"\n   [Crawler] Intelligence run: {merchant_name} (slug={merchant_slug})")
         targets = build_targets_ranked(
@@ -112,6 +137,8 @@ class CrawlerAgent(BaseAgent):
             return self._empty_payload(merchant_name, merchant_slug, error=str(e))
 
         raw_texts = {s.get("source_name", ""): s.pop("_raw_text", "") for s in sources}
+        for s in sources:
+            s.pop("_html", None)
         parser_events: List[Dict[str, Any]] = []
         for s in sources:
             parser_events.extend(s.pop("_parser_events", []) or [])
@@ -129,6 +156,7 @@ class CrawlerAgent(BaseAgent):
             sources,
             raw_texts=raw_texts,
             parser_events=parser_events,
+            crawl_mode=crawl_mode,
         )
         events = intel_bundle["events"]
         schedule_meta = self.scheduler.mark_crawled(merchant_slug, events)
@@ -152,7 +180,7 @@ class CrawlerAgent(BaseAgent):
         if events:
             print(f"   [Crawler] {CYAN}Events:{RESET} {[e['type'] for e in events]}")
 
-        return {
+        payload = {
             "merchant": merchant_name,
             "merchant_slug": merchant_slug,
             "cashback_rate": best_cashback,
@@ -176,6 +204,8 @@ class CrawlerAgent(BaseAgent):
                 e for e in events if e.get("type") == "competitive_intent_detected"
             ],
             "sweep": intel_bundle.get("sweep"),
+            "evidence_validation": intel_bundle.get("evidence_validation"),
+            "budget": self.budget.status(),
             "intelligence_stream": intel_bundle.get("stream_recent"),
             "data_source": "live_web",
             "summary": (
@@ -186,10 +216,154 @@ class CrawlerAgent(BaseAgent):
             "results": sources,
             "_cost_usd": total_cost,
             "phase": "C",
+            "crawl_plan": {
+                "mode": plan.mode,
+                "full_scrape": plan.full_scrape,
+                "follow_links": plan.follow_links,
+                "reason": plan.reason,
+            },
         }
+        if os.getenv("CRAWLER_VALIDATE_CONTRACT", "true").lower() == "true":
+            from state.contracts import validate_intelligence_output
+
+            validate_intelligence_output(payload)
+        return payload
 
     def get_due_merchants(self, display_names: List[str] | None = None) -> List[str]:
         return self.policy.due_merchants(display_names)
+
+    def apply_pipeline_feedback(
+        self,
+        merchant_slug: str,
+        *,
+        analyst_risk: Optional[str] = None,
+        strategist_priority: Optional[str] = None,
+    ):
+        """
+        Closed-loop schedule boost from analyst/strategist outputs.
+        Persists risk/priority on merchant_schedule and escalates crawl cadence.
+        """
+        from datetime import timedelta
+        from agents.crawler.scheduling.policy import (
+            CrawlDecision,
+            INTERVAL_CRITICAL,
+            INTERVAL_HOT,
+        )
+
+        slug = normalize_query(merchant_slug)
+        self.store.set_intelligence_feedback(
+            slug,
+            analyst_risk=analyst_risk,
+            strategist_priority=strategist_priority,
+        )
+
+        risk = (analyst_risk or "").upper()
+        priority = (strategist_priority or "").upper()
+
+        if risk == "HIGH" or priority == "HIGH":
+            decision = CrawlDecision(
+                slug,
+                INTERVAL_CRITICAL,
+                1,
+                "critical",
+                "pipeline feedback: HIGH analyst risk or strategist priority",
+            )
+        elif risk == "MEDIUM" or priority == "MEDIUM":
+            decision = CrawlDecision(
+                slug,
+                INTERVAL_HOT,
+                2,
+                "hot",
+                "pipeline feedback: elevated risk or priority",
+            )
+        else:
+            decision = self.policy.decide_interval(slug)
+
+        hot_until = None
+        if decision.mode in ("critical", "hot"):
+            hold_sec = decision.interval_sec * 6
+            hot_until = (datetime.now(timezone.utc) + timedelta(seconds=hold_sec)).isoformat()
+
+        self.store.set_schedule(
+            slug,
+            interval_sec=decision.interval_sec,
+            hot_until=hot_until,
+            priority_tier=1 if slug in {"myntra", "flipkart", "amazon"} else 2,
+            crawl_mode=decision.mode,
+            monitor_reason=decision.reason,
+        )
+        return decision
+
+    def apply_pipeline_feedback(
+        self,
+        merchant_slug: str,
+        *,
+        analyst_risk: Optional[str] = None,
+        strategist_priority: Optional[str] = None,
+        crawler_data: Optional[Dict[str, Any]] = None,
+        analysis: Optional[Dict[str, Any]] = None,
+        strategy: Optional[Dict[str, Any]] = None,
+    ) -> Optional[CrawlDecision]:
+        """Update schedule/risk from analyst+strategist pipeline output."""
+        if analysis and analyst_risk is None:
+            analyst_risk = analysis.get("risk_level")
+        if strategy and strategist_priority is None:
+            strategist_priority = strategy.get("priority")
+        if crawler_data:
+            if analyst_risk is None:
+                analyst_risk = crawler_data.get("analyst_risk")
+            if strategist_priority is None:
+                strategist_priority = crawler_data.get("strategist_priority")
+
+        slug = normalize_query(merchant_slug)
+        self.store.set_intelligence_feedback(
+            slug,
+            analyst_risk=analyst_risk,
+            strategist_priority=strategist_priority,
+        )
+
+        risk = (analyst_risk or "LOW").upper()
+        priority = (strategist_priority or "LOW").upper()
+        from datetime import timedelta
+
+        if risk in ("HIGH", "CRITICAL") or priority in ("HIGH", "CRITICAL"):
+            hot_until = (
+                datetime.now(timezone.utc) + timedelta(seconds=INTERVAL_CRITICAL * 6)
+            ).isoformat()
+            self.store.set_schedule(
+                slug,
+                interval_sec=INTERVAL_CRITICAL,
+                hot_until=hot_until,
+                priority_tier=1,
+                crawl_mode="critical",
+                monitor_reason="pipeline feedback escalation",
+            )
+            return CrawlDecision(
+                slug,
+                INTERVAL_CRITICAL,
+                1,
+                "critical",
+                "analyst/strategist escalation",
+            )
+
+        if risk == "MEDIUM" or priority == "MEDIUM":
+            self.store.set_schedule(
+                slug,
+                interval_sec=INTERVAL_HOT,
+                hot_until=None,
+                priority_tier=2,
+                crawl_mode="hot",
+                monitor_reason="pipeline feedback medium priority",
+            )
+            return CrawlDecision(
+                slug,
+                INTERVAL_HOT,
+                2,
+                "hot",
+                "medium pipeline priority",
+            )
+
+        return self.policy.decide_interval(slug)
 
     def monitoring_summary(self) -> List[Dict[str, Any]]:
         """Per-merchant schedule snapshot for operators."""
@@ -213,74 +387,8 @@ class CrawlerAgent(BaseAgent):
         self,
         merchants: Optional[List[str]] = None,
     ) -> None:
-        """
-        Autonomous market radar — no orchestrator required.
-
-        Self-decides which merchants are due, crawl priority, and sleep cadence
-        from AdaptiveCrawlPolicy + SQLite history.
-        """
-        watchlist = merchants or self.policy.active_watchlist()
-        print("=" * 55)
-        print("CRAWLER AGENT — AUTONOMOUS SURVEILLANCE")
-        print("=" * 55)
-        print(f"Watchlist: {watchlist}")
-        print(f"Workers: {self.worker_pool.concurrency} | Proxies: {'on' if self.collector_proxy_enabled else 'off'}")
-        print("Press Ctrl+C to stop.\n")
-
-        iteration = 0
-        while True:
-            iteration += 1
-            watchlist = self.policy.active_watchlist()
-            due = self.get_due_merchants(watchlist)
-            waiting = [m for m in watchlist if m not in due]
-            print(f"\n--- [CRAWLER {iteration}] Due: {due or '(none)'} ---")
-            if waiting:
-                print(f"   On interval: {waiting}")
-
-            for name in due:
-                slug = normalize_query(name)
-                decision = self.policy.decide_interval(slug)
-                self.store.enqueue_crawl(slug, priority=decision.priority)
-
-            tasks = self.store.claim_tasks(self._radar_worker_id, limit=max(len(due), 1))
-            for task in tasks:
-                slug = task["merchant_slug"]
-                display = self._display_for_slug(slug, watchlist)
-                try:
-                    payload = await self.collect_intelligence(f"Analyze {display} coupons")
-                    self.store.complete_task(
-                        task["id"],
-                        {
-                            "merchant": slug,
-                            "events": len(payload.get("events", [])),
-                            "mode": (payload.get("monitoring") or {}).get("crawl_mode"),
-                        },
-                    )
-                    self._log_surveillance_result(payload)
-                except Exception as e:
-                    print(f"   [Crawler] Task {task['id']} failed: {e}")
-                    self.store.complete_task(task["id"], {"error": str(e)}, failed=True)
-
-            sleep_sec = self.policy.sleep_between_iterations(len(tasks))
-            print(f"--- [CRAWLER {iteration}] {len(tasks)} run(s). Sleep {sleep_sec}s ---")
-            await asyncio.sleep(sleep_sec)
-
-    def _display_for_slug(self, slug: str, merchants: List[str]) -> str:
-        for name in merchants:
-            if normalize_query(name) == slug:
-                return name
-        return merchant_display(slug)
-
-    def _log_surveillance_result(self, payload: Dict[str, Any]) -> None:
-        monitoring = payload.get("monitoring") or {}
-        events = payload.get("events") or []
-        if events:
-            print(f"   [Crawler] Events: {[e.get('type') for e in events]}")
-        if monitoring:
-            print(
-                f"   [Crawler] Next: {monitoring.get('crawl_mode')} "
-                f"every {monitoring.get('crawl_interval_sec')}s — {monitoring.get('monitor_reason', '')}"
-            )
+        """Autonomous surveillance — delegates to SurveillanceEngine."""
+        await SurveillanceEngine(self).run(merchants)
 
     def _empty_payload(self, merchant_name: str, slug: str, error: str) -> Dict[str, Any]:
         return {

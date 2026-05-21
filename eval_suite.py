@@ -1,7 +1,16 @@
 import asyncio
+import sys
 import time
 import json
 import os
+
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from orchestrator.orchestrator import SwarmOrchestrator
 from messaging.schemas import AgentRole
 from agents.crawler import CrawlerAgent

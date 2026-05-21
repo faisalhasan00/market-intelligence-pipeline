@@ -6,6 +6,7 @@ from typing import List
 
 from agents.crawler.platform.categories import category_profile
 from agents.crawler.crawl.profiles import COMPETITOR_STORE_URLS, CrawlTarget, DEFAULT_COMPETITORS
+from agents.crawler.platform.memory import CrawlerMemory
 from agents.crawler.platform.store import IntelligenceStore
 import urllib.parse
 
@@ -50,6 +51,7 @@ def build_targets_ranked(
         full_scrape=full_scrape
     )
     names = ordered_competitors(store, count, merchant_slug)
+    names = CrawlerMemory(store).plan_sources(merchant_slug, names)
     targets: List[CrawlTarget] = []
     for name in names:
         template = COMPETITOR_STORE_URLS[name]

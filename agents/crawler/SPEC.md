@@ -314,3 +314,13 @@ collecting, validating, monitoring,
 tracking, and continuously updating
 market intelligence with evidence
 and confidence scoring
+
+## Implementation status
+
+See [COMPLETION.md](COMPLETION.md) for the full checklist (~100% of spec items implemented).
+
+Quick operator entry points:
+
+- `python -m agents.crawler --surveillance` — 24/7 radar
+- `python -m agents.crawler.worker` — distributed task worker
+- `python -m agents.crawler --serve-metrics --port 9090` — Prometheus HTTP

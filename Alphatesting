@@ -1,0 +1,90 @@
+# Swarm — Agent Completion Status (updated)
+
+**Project name:** Swarm — Multi-Agent Competitive Intelligence System  
+**Tests:** `python -m unittest discover tests -q` → **81 tests OK**
+
+---
+
+## Summary
+
+| # | Component | ~% Complete | Production-ready? |
+|---|-----------|-------------|-------------------|
+| 1 | **Crawler** | **~98%** | Yes (demo + ops); paid captcha solver deferred |
+| 2 | **Orchestrator** | **~100%** | Yes (single-writer); distributed state = phase 2 |
+| 3 | **Analyst** | **~100%** | Yes (rules + LLM); full ML prediction = phase 2 |
+| 4 | **Strategist** | **~100%** | Yes; approval UI = file queue only |
+| 5 | **Alerter** | **~100%** | Yes when webhooks configured; audit file always |
+
+**Overall swarm:** **~99%** for GrabOn submission / end-to-end demo scope.
+
+---
+
+## 1. Crawler (~98%)
+
+**Done:** SurveillanceEngine, IntelligenceHub, budget, evidence validator, worker CLI, metrics HTTP, geo, browser pool, sessions, Redis queue (optional), antibot, navigation, `apply_pipeline_feedback`, 20 tests.
+
+**Deferred:** Paid captcha vendor, bespoke SSO logins per merchant.
+
+```bash
+python -m agents.crawler --surveillance
+python -m agents.crawler.worker
+python -m agents.crawler --serve-metrics --port 9090
+```
+
+---
+
+## 2. Orchestrator (~100%)
+
+**Done:** Retries, PipelineResult, parallel merchants, stream/JSONL hooks, webhook server, dead-letter, state lock, crawler feedback, 10 tests.
+
+```bash
+python main.py
+python -m orchestrator --once Myntra
+python -m orchestrator --webhook-server --port 8081
+```
+
+---
+
+## 3. Analyst (~100%)
+
+**Done:** AnalystOutputContract, history, event matrix, predictive fields, cache, shadow persistence, 18 tests.
+
+```bash
+python -m agents.analyst
+python -m unittest tests.test_analyst -v
+```
+
+---
+
+## 4. Strategist (~100%)
+
+**Done:** Playbooks, approval queue CLI, notification_preview, game-theory fields, 13 tests.
+
+```bash
+python -m agents.strategist
+python -m agents.strategist --list-pending
+```
+
+---
+
+## 5. Alerter (~100%)
+
+**Done:** Slack/webhook/file, severity, dedupe, quiet hours, contract, stream hook, 20 tests.
+
+```bash
+# Set SLACK_WEBHOOK_URL + ALERTER_SLACK_ENABLED=true for live Slack
+python -m agents.alerter
+python -m unittest tests.test_alerter -v
+```
+
+---
+
+## Full pipeline
+
+```bash
+python -m orchestrator --once "Myntra"
+# or 24/7:
+python main.py
+```
+
+See `.env.example` for all configuration.

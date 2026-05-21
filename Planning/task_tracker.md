@@ -7,13 +7,13 @@ This document tracks the progress of the GrabOn AI Labs Assignment 06.
 - [x] Define scenario: Competitive Intelligence Pipeline
 - [x] Identify 3+ Agents and Roles
 
-## Phase 2: Planning [IN PROGRESS]
+## Phase 2: Planning [DONE]
 - [x] Initialize project directory structure
 - [x] Set up `Planning/` folder for audit trail
 - [x] Define API Strategy (Gemini, Groq, Ollama)
-- [ ] Finalize Environment Configuration
+- [x] Finalize Environment Configuration
 
-## Phase 3: System Design [IN PROGRESS]
+## Phase 3: System Design [DONE]
 - [x] Define Messaging Protocol (Pydantic Schemas)
 - [x] Implement Versioned Shared State Store
 - [x] Implement Central Orchestrator (Control Plane)
@@ -33,14 +33,14 @@ This document tracks the progress of the GrabOn AI Labs Assignment 06.
 - [x] Add Conflict Resolution Logic
 - [x] Add Observability (JSON Timeline)
 
-## Phase 5: Testing
-- [ ] Scenario 1: Happy Path
-- [ ] Scenario 2: Data Discrepancy Conflict
-- [ ] Scenario 3: Strategy Disagreement Conflict
-- [ ] Scenario 4: Budget Exceeded Termination
-- [ ] Scenario 5: Agent Timeout Recovery
+## Phase 5: Testing [DONE]
+- [x] Scenario 1: Happy Path
+- [x] Scenario 2: Data Discrepancy Conflict
+- [x] Scenario 3: Strategy Disagreement Conflict
+- [x] Scenario 4: Budget Exceeded Termination
+- [x] Scenario 5: Agent Timeout Recovery
 
-## Phase 6: Deployment
-- [ ] Final README.md with Architecture Diagrams
-- [ ] Generate Eval Report (JSON/CSV)
-- [ ] Record Loom Video Demonstration
+## Phase 6: Deployment [DONE]
+- [x] Final README.md with Architecture Diagrams
+- [x] Generate Eval Report (JSON/CSV)
+- [x] Record Loom Video Demonstration

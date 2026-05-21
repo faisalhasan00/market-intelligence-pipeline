@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from agents.crawler.crawl.profiles import MERCHANT_DISPLAY, merchant_display, normalize_query
 from agents.crawler.platform.store import IntelligenceStore
+from agents.crawler.scheduling.actions import ActionType, CrawlAction, CrawlPlan
 
 # Crawl cadence (seconds)
 INTERVAL_CRITICAL = 300    # 5 min — active sale / spike / HIGH risk
@@ -79,28 +80,158 @@ class AdaptiveCrawlPolicy:
         return [merchant_display(slug) for slug in MERCHANT_DISPLAY]
 
     def active_watchlist(self) -> List[str]:
-        """
-        Merchants to monitor: configured watchlist plus any slug in a hot
-        window or with recent critical market events from the crawler.
-        """
-        base = self.default_watchlist()
-        slugs_in_base = {normalize_query(n) for n in base}
-        extra: List[str] = []
-        for slug in self.store.list_schedules():
-            if slug in slugs_in_base:
-                continue
-            if self.store.is_in_hot_window(slug):
-                extra.append(merchant_display(slug))
-                continue
-            recent = self.store.get_recent_events(slug, limit=5)
-            if any(e.get("type") in CRITICAL_EVENT_TYPES for e in recent):
-                extra.append(merchant_display(slug))
-        return base + extra
+        """Merchants to monitor via registry (env seed + hot promotions)."""
+        from agents.crawler.platform.registry import MerchantRegistry
+
+        return MerchantRegistry(self.store, self).get_active_merchants()
+
+    def plan_crawl(
+        self,
+        merchant_slug: str,
+        *,
+        force_full: bool = False,
+        budget=None,
+    ) -> CrawlPlan:
+        """Crawl depth and priority for the next run on this merchant."""
+        slug = merchant_slug.lower().strip()
+        decision = self.decide_interval(slug)
+        full = force_full or decision.mode in ("critical", "hot")
+        if os.getenv("CRAWLER_ALWAYS_FULL_SCRAPE", "false").lower() == "true":
+            full = True
+        reason = decision.reason
+        if budget is not None:
+            if budget.is_over_hourly_limit():
+                full = False
+                reason = f"{reason} (budget: hourly cap)"
+            elif budget.should_conserve() and not force_full:
+                full = False
+                reason = f"{reason} (budget: conserve)"
+        follow = (
+            os.getenv("CRAWLER_FOLLOW_LINKS_ON_CRITICAL", "true").lower() == "true"
+            and decision.mode == "critical"
+            and (budget is None or not budget.is_over_hourly_limit())
+        )
+        return CrawlPlan(
+            merchant_slug=slug,
+            full_scrape=full,
+            priority=decision.priority,
+            mode=decision.mode,
+            reason=reason,
+            follow_links=follow,
+        )
+
+    def act(self, merchant_slug: str, payload: Dict) -> List[CrawlAction]:
+        """Closed-loop actions after a crawl based on intelligence output."""
+        slug = merchant_slug.lower().strip()
+        events: List[Dict] = payload.get("events") or []
+        types = {e.get("type") for e in events}
+        actions: List[CrawlAction] = []
+
+        if types & CRITICAL_EVENT_TYPES:
+            actions.append(
+                CrawlAction(
+                    ActionType.FULL_SCRAPE,
+                    slug,
+                    priority=0,
+                    reason="critical market signal",
+                )
+            )
+            actions.append(
+                CrawlAction(
+                    ActionType.SET_CRITICAL,
+                    slug,
+                    reason="escalate monitoring cadence",
+                )
+            )
+            self._promote_registry(slug)
+
+        sweep = payload.get("sweep") or {}
+        if types & CRITICAL_EVENT_TYPES and not sweep.get("sweep"):
+            actions.append(
+                CrawlAction(
+                    ActionType.MARKET_SWEEP,
+                    slug,
+                    reason="spike without sweep yet",
+                    payload={"events": events},
+                )
+            )
+
+        anomaly = payload.get("anomaly") or {}
+        if anomaly.get("requires_revalidation") or "rate_anomaly_detected" in types:
+            delay = int(os.getenv("CRAWLER_RECRAWL_DELAY_SEC", "120"))
+            actions.append(
+                CrawlAction(
+                    ActionType.RECRAWL_IN,
+                    slug,
+                    delay_sec=delay,
+                    priority=0,
+                    reason="anomaly revalidation",
+                )
+            )
+
+        if "consensus_contradiction" in types:
+            actions.append(
+                CrawlAction(
+                    ActionType.RECRAWL_TRUSTED,
+                    slug,
+                    priority=1,
+                    reason="consensus mismatch",
+                )
+            )
+
+        parser_drifts = [e for e in events if e.get("type") == "parser_drift_detected"]
+        if parser_drifts and not any(e.get("recovered") for e in parser_drifts):
+            actions.append(
+                CrawlAction(
+                    ActionType.ROTATE_PROXY,
+                    slug,
+                    reason="parser drift without recovery",
+                )
+            )
+
+        decision = self.decide_interval(slug, fresh_events=events)
+        if decision.mode == "dormant":
+            actions.append(
+                CrawlAction(
+                    ActionType.SET_DORMANT,
+                    slug,
+                    reason="sustained quiet period",
+                )
+            )
+
+        if not actions:
+            actions.append(CrawlAction(ActionType.CRAWL_ONLY, slug))
+        return actions
+
+    def _promote_registry(self, slug: str) -> None:
+        from agents.crawler.platform.registry import MerchantRegistry
+
+        MerchantRegistry(self.store, self).promote(slug, hours=24)
 
     # --- Interval & escalation ---
 
     def decide_interval(self, merchant_slug: str, *, fresh_events: Optional[List[Dict]] = None) -> CrawlDecision:
         slug = merchant_slug.lower().strip()
+        schedule = self.store.get_merchant_schedule(slug) or {}
+        analyst_risk = (schedule.get("analyst_risk") or "LOW").upper()
+        strategist_pri = (schedule.get("strategist_priority") or "LOW").upper()
+        if analyst_risk in ("HIGH", "CRITICAL") or strategist_pri in ("HIGH", "CRITICAL"):
+            return CrawlDecision(
+                slug,
+                INTERVAL_CRITICAL,
+                1,
+                "critical",
+                "analyst/strategist priority from pipeline",
+            )
+        if analyst_risk == "MEDIUM" or strategist_pri == "MEDIUM":
+            return CrawlDecision(
+                slug,
+                INTERVAL_HOT,
+                2,
+                "hot",
+                "medium pipeline priority",
+            )
+
         events = fresh_events if fresh_events is not None else self.store.get_recent_events(slug, limit=20)
         event_types = {e.get("type") for e in events}
         if self.store.is_in_hot_window(slug):

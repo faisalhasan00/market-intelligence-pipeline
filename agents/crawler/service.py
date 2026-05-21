@@ -1,4 +1,4 @@
-"""Entry point for autonomous crawler surveillance (delegates to CrawlerAgent)."""
+"""Entry point for autonomous crawler surveillance (SurveillanceEngine)."""
 from __future__ import annotations
 
 import asyncio
@@ -6,12 +6,13 @@ import asyncio
 from dotenv import load_dotenv
 
 from agents.crawler.agent import CrawlerAgent
+from agents.crawler.surveillance import SurveillanceEngine
 
 load_dotenv()
 
 
 async def main() -> None:
-    await CrawlerAgent().run_autonomous_forever()
+    await SurveillanceEngine(CrawlerAgent()).run()
 
 
 if __name__ == "__main__":

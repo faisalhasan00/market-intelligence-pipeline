@@ -20,6 +20,9 @@ class IntelligenceStore:
         self._lock = threading.Lock()
         self._init_schema()
         self._migrate_legacy_json()
+        from agents.crawler.platform.queue import get_queue_backend
+
+        self._queue = get_queue_backend(self)
 
     @contextmanager
     def _conn(self):
@@ -171,9 +174,54 @@ class IntelligenceStore:
 
                 CREATE INDEX IF NOT EXISTS idx_rate_samples ON rate_samples(merchant_slug, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_dom_history ON dom_history(merchant_slug, source_name);
+
+                CREATE TABLE IF NOT EXISTS merchants (
+                    merchant_slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    category TEXT,
+                    tier INTEGER DEFAULT 2,
+                    enabled INTEGER DEFAULT 1,
+                    client_priority INTEGER DEFAULT 0,
+                    promoted_until TEXT,
+                    dormant_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS budget_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    merchant_slug TEXT,
+                    cost_usd REAL DEFAULT 0,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_budget_events_time
+                    ON budget_events(event_type, recorded_at);
+
+                CREATE TABLE IF NOT EXISTS analyst_outputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    merchant_slug TEXT NOT NULL,
+                    output_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_analyst_outputs_merchant
+                    ON analyst_outputs(merchant_slug, created_at);
+
+                CREATE TABLE IF NOT EXISTS analyst_shadow_deltas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    merchant_slug TEXT NOT NULL,
+                    primary_risk TEXT NOT NULL,
+                    shadow_risk TEXT NOT NULL,
+                    shadow_model TEXT,
+                    delta_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_analyst_shadow_merchant
+                    ON analyst_shadow_deltas(merchant_slug, created_at);
                 """
             )
         self._migrate_schedule_columns()
+        self._migrate_reliability_columns()
         self._migrate_snapshot_columns()
 
     def _migrate_schedule_columns(self) -> None:
@@ -187,6 +235,12 @@ class IntelligenceStore:
             ):
                 if col not in existing:
                     conn.execute(f"ALTER TABLE merchant_schedule ADD COLUMN {col} {ddl}")
+
+    def _migrate_reliability_columns(self) -> None:
+        with self._lock, self._conn() as conn:
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(source_reliability)").fetchall()}
+            if "cooldown_until" not in existing:
+                conn.execute("ALTER TABLE source_reliability ADD COLUMN cooldown_until TEXT")
 
     def _migrate_snapshot_columns(self) -> None:
         with self._lock, self._conn() as conn:
@@ -424,6 +478,41 @@ class IntelligenceStore:
             ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
 
+    def set_source_cooldown(
+        self,
+        source_name: str,
+        *,
+        minutes: int = 20,
+        reason: Optional[str] = None,
+    ) -> None:
+        until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+        now = _utc_now()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_reliability (source_name, cooldown_until, last_failure_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source_name) DO UPDATE SET
+                    cooldown_until = excluded.cooldown_until,
+                    last_failure_at = excluded.last_failure_at
+                """,
+                (source_name, until, now),
+            )
+
+    def is_source_in_cooldown(self, source_name: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT cooldown_until FROM source_reliability WHERE source_name = ?",
+                (source_name,),
+            ).fetchone()
+        if not row or not row["cooldown_until"]:
+            return False
+        try:
+            until = datetime.fromisoformat(str(row["cooldown_until"]).replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) < until
+        except ValueError:
+            return False
+
     def update_source_reliability(self, source_name: str, *, success: bool, blocked: bool) -> float:
         now = _utc_now()
         with self._lock, self._conn() as conn:
@@ -629,19 +718,63 @@ class IntelligenceStore:
             return True
 
     def enqueue_crawl(self, merchant_slug: str, priority: int = 5) -> int:
+        return self._queue.enqueue_crawl(merchant_slug, priority)
+
+    def reclaim_stale_tasks(self, *, stale_minutes: Optional[int] = None) -> int:
+        return self._queue.reclaim_stale_tasks(stale_minutes=stale_minutes)
+
+    def claim_tasks(self, worker_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        return self._queue.claim_tasks(worker_id, limit)
+
+    def get_queue_stats(self) -> Dict[str, int]:
+        return self._queue.get_queue_stats()
+
+    def complete_task(self, task_id: int, result: Dict[str, Any], *, failed: bool = False) -> None:
+        return self._queue.complete_task(task_id, result, failed=failed)
+
+    def _enqueue_crawl_sqlite(self, merchant_slug: str, priority: int = 5) -> int:
+        """Enqueue merchant crawl; skips if same slug already pending/running."""
         now = _utc_now()
+        slug = merchant_slug.lower().strip()
         with self._lock, self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM crawl_tasks
+                WHERE merchant_slug = ? AND status IN ('pending', 'running')
+                ORDER BY priority ASC, id ASC LIMIT 1
+                """,
+                (slug,),
+            ).fetchone()
+            if row:
+                return int(row["id"])
             cur = conn.execute(
                 """
                 INSERT INTO crawl_tasks (merchant_slug, status, priority, created_at)
                 VALUES (?, 'pending', ?, ?)
                 """,
-                (merchant_slug, priority, now),
+                (slug, priority, now),
             )
             return int(cur.lastrowid)
 
-    def claim_tasks(self, worker_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+    def _reclaim_stale_tasks_sqlite(self, *, stale_minutes: Optional[int] = None) -> int:
+        """Return running tasks stuck past stale window to pending (multi-worker safety)."""
+        minutes = stale_minutes or int(os.getenv("CRAWLER_TASK_STALE_MINUTES", "45"))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crawl_tasks
+                SET status = 'pending', worker_id = NULL, started_at = NULL
+                WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?
+                """,
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
+
+    def _claim_tasks_sqlite(self, worker_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """Atomically claim pending tasks (one UPDATE per row to avoid duplicate work)."""
         now = _utc_now()
+        claimed: List[Dict[str, Any]] = []
         with self._lock, self._conn() as conn:
             rows = conn.execute(
                 """
@@ -652,18 +785,67 @@ class IntelligenceStore:
                 """,
                 (limit,),
             ).fetchall()
-            tasks = [dict(r) for r in rows]
-            for t in tasks:
-                conn.execute(
+            for row in rows:
+                cur = conn.execute(
                     """
-                    UPDATE crawl_tasks SET status='running', worker_id=?, started_at=?
-                    WHERE id=?
+                    UPDATE crawl_tasks
+                    SET status = 'running', worker_id = ?, started_at = ?
+                    WHERE id = ? AND status = 'pending'
                     """,
-                    (worker_id, now, t["id"]),
+                    (worker_id, now, row["id"]),
                 )
-            return tasks
+                if cur.rowcount:
+                    claimed.append(dict(row))
+        return claimed
 
-    def complete_task(self, task_id: int, result: Dict[str, Any], *, failed: bool = False) -> None:
+    def _get_queue_stats_sqlite(self) -> Dict[str, int]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS c FROM crawl_tasks GROUP BY status
+                """
+            ).fetchall()
+        counts = {r["status"]: int(r["c"]) for r in rows}
+        return {
+            "pending": counts.get("pending", 0),
+            "running": counts.get("running", 0),
+            "done": counts.get("done", 0),
+            "failed": counts.get("failed", 0),
+            "total": sum(counts.values()),
+        }
+
+    def get_crawl_run_stats(self, *, hours: float = 24.0) -> Dict[str, Any]:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c,
+                       COALESCE(SUM(cost_usd), 0) AS cost,
+                       COALESCE(SUM(event_count), 0) AS events
+                FROM crawl_runs WHERE finished_at >= ?
+                """,
+                (since,),
+            ).fetchone()
+        if not row:
+            return {"count": 0, "cost_usd": 0.0, "events": 0}
+        return {
+            "count": int(row["c"] or 0),
+            "cost_usd": round(float(row["cost"] or 0), 4),
+            "events": int(row["events"] or 0),
+        }
+
+    def get_event_stats(self, *, hours: float = 24.0) -> Dict[str, Any]:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM intelligence_events WHERE created_at >= ?
+                """,
+                (since,),
+            ).fetchone()
+        return {"count": int(row["c"] or 0) if row else 0}
+
+    def _complete_task_sqlite(self, task_id: int, result: Dict[str, Any], *, failed: bool = False) -> None:
         now = _utc_now()
         status = "failed" if failed else "done"
         with self._lock, self._conn() as conn:
@@ -870,6 +1052,303 @@ class IntelligenceStore:
                 (merchant_slug, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Merchant registry ---
+
+    def upsert_merchant(
+        self,
+        merchant_slug: str,
+        *,
+        display_name: str,
+        category: Optional[str] = None,
+        tier: int = 2,
+        enabled: bool = True,
+        client_priority: int = 0,
+        promoted_until: Optional[str] = None,
+    ) -> None:
+        now = _utc_now()
+        slug = merchant_slug.lower().strip()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO merchants
+                (merchant_slug, display_name, category, tier, enabled, client_priority,
+                 promoted_until, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(merchant_slug) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    category = COALESCE(excluded.category, merchants.category),
+                    tier = excluded.tier,
+                    enabled = excluded.enabled,
+                    client_priority = excluded.client_priority,
+                    promoted_until = COALESCE(excluded.promoted_until, merchants.promoted_until),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    slug,
+                    display_name,
+                    category,
+                    tier,
+                    1 if enabled else 0,
+                    client_priority,
+                    promoted_until,
+                    now,
+                    now,
+                ),
+            )
+
+    def list_merchants(self, *, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            if enabled_only:
+                rows = conn.execute(
+                    "SELECT * FROM merchants WHERE enabled = 1 ORDER BY tier ASC, display_name ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM merchants ORDER BY tier ASC, display_name ASC"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_merchant(self, merchant_slug: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM merchants WHERE merchant_slug = ?",
+                (merchant_slug.lower().strip(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_merchant_enabled(self, merchant_slug: str, enabled: bool) -> None:
+        now = _utc_now()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE merchants SET enabled = ?, updated_at = ? WHERE merchant_slug = ?",
+                (1 if enabled else 0, now, merchant_slug.lower().strip()),
+            )
+
+    def promote_merchant(self, merchant_slug: str, *, hours: int = 24) -> None:
+        until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+        now = _utc_now()
+        slug = merchant_slug.lower().strip()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE merchants SET promoted_until = ?, updated_at = ?
+                WHERE merchant_slug = ?
+                """,
+                (until, now, slug),
+            )
+
+    def is_merchant_promoted(self, merchant_slug: str) -> bool:
+        row = self.get_merchant(merchant_slug)
+        if not row or not row.get("promoted_until"):
+            return False
+        try:
+            until = datetime.fromisoformat(str(row["promoted_until"]).replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) < until
+        except ValueError:
+            return False
+
+    def increment_dormant_count(self, merchant_slug: str) -> int:
+        now = _utc_now()
+        slug = merchant_slug.lower().strip()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO merchants (merchant_slug, display_name, tier, enabled, dormant_count, created_at, updated_at)
+                VALUES (?, ?, 2, 1, 1, ?, ?)
+                ON CONFLICT(merchant_slug) DO UPDATE SET
+                    dormant_count = merchants.dormant_count + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (slug, slug.title(), now, now),
+            )
+            row = conn.execute(
+                "SELECT dormant_count FROM merchants WHERE merchant_slug = ?",
+                (slug,),
+            ).fetchone()
+        return int(row["dormant_count"] or 0) if row else 0
+
+    def get_hourly_crawl_cost(self, hours: float = 1.0) -> float:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(cost_usd), 0) AS total FROM crawl_runs
+                WHERE finished_at >= ?
+                """,
+                (since,),
+            ).fetchone()
+        return float(row["total"] or 0.0) if row else 0.0
+
+    def record_budget_event(
+        self,
+        event_type: str,
+        *,
+        merchant_slug: Optional[str] = None,
+        cost_usd: float = 0.0,
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO budget_events (event_type, merchant_slug, cost_usd, recorded_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (event_type, merchant_slug, cost_usd, now),
+            )
+
+    def count_budget_events(
+        self,
+        event_type: str,
+        *,
+        merchant_slug: Optional[str] = None,
+        hours: float = 24.0,
+    ) -> int:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            if merchant_slug:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM budget_events
+                    WHERE event_type = ? AND merchant_slug = ? AND recorded_at >= ?
+                    """,
+                    (event_type, merchant_slug.lower().strip(), since),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM budget_events
+                    WHERE event_type = ? AND recorded_at >= ?
+                    """,
+                    (event_type, since),
+                ).fetchone()
+        return int(row["c"] or 0) if row else 0
+
+    def has_baseline(self, merchant_slug: str) -> bool:
+        """True after at least one completed intelligence run for this merchant."""
+        slug = merchant_slug.lower().strip()
+        with self._conn() as conn:
+            run = conn.execute(
+                "SELECT 1 FROM crawl_runs WHERE merchant_slug = ? LIMIT 1",
+                (slug,),
+            ).fetchone()
+            if run:
+                return True
+            snap = conn.execute(
+                "SELECT 1 FROM source_snapshots WHERE merchant_slug = ? LIMIT 1",
+                (slug,),
+            ).fetchone()
+        return snap is not None
+
+    def record_analyst_output(self, merchant_slug: str, output: Dict[str, Any]) -> None:
+        """Persist a finalized analyst run for timeline / prompt history."""
+        slug = merchant_slug.lower().strip()
+        now = _utc_now()
+        slim = {
+            k: output.get(k)
+            for k in (
+                "risk_level",
+                "gap_summary",
+                "recommended_action",
+                "confidence",
+                "trend",
+                "response_probability",
+                "predicted_competitor_move",
+                "competitor_advantage_pct",
+                "gap_found",
+                "analysis_mode",
+            )
+            if output.get(k) is not None
+        }
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO analyst_outputs (merchant_slug, output_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (slug, json.dumps(slim), now),
+            )
+
+    def get_analyst_history(
+        self, merchant_slug: str, limit: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Recent analyst outputs for a merchant (newest first)."""
+        slug = merchant_slug.lower().strip()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT output_json, created_at FROM analyst_outputs
+                WHERE merchant_slug = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (slug, limit),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["output_json"])
+            except json.JSONDecodeError:
+                continue
+            payload["recorded_at"] = row["created_at"]
+            out.append(payload)
+        return out
+
+    def record_analyst_shadow_delta(
+        self,
+        merchant_slug: str,
+        *,
+        primary_risk: str,
+        shadow_risk: str,
+        shadow_model: Optional[str] = None,
+        delta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log primary vs shadow risk mismatch for calibration."""
+        slug = merchant_slug.lower().strip()
+        now = _utc_now()
+        delta_payload = delta or {"primary": primary_risk, "shadow": shadow_risk}
+        try:
+            with self._lock, self._conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO analyst_shadow_deltas
+                    (merchant_slug, primary_risk, shadow_risk, shadow_model, delta_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        slug,
+                        primary_risk.upper(),
+                        shadow_risk.upper(),
+                        shadow_model,
+                        json.dumps(delta_payload),
+                        now,
+                    ),
+                )
+        except sqlite3.Error:
+            self._append_analyst_shadow_jsonl(
+                slug, primary_risk, shadow_risk, shadow_model, delta_payload, now
+            )
+
+    @staticmethod
+    def _append_analyst_shadow_jsonl(
+        merchant_slug: str,
+        primary_risk: str,
+        shadow_risk: str,
+        shadow_model: Optional[str],
+        delta: Dict[str, Any],
+        created_at: str,
+    ) -> None:
+        path = os.path.join("logs", "analyst_shadow.jsonl")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        row = {
+            "merchant_slug": merchant_slug,
+            "primary_risk": primary_risk,
+            "shadow_risk": shadow_risk,
+            "shadow_model": shadow_model,
+            "delta": delta,
+            "created_at": created_at,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
 
 
 def _utc_now() -> str:

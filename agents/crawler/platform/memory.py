@@ -61,6 +61,31 @@ class CrawlerMemory:
             "behavior_notes": json.loads(row.get("behavior_json") or "{}"),
         }
 
+    def plan_sources(self, merchant_slug: str, candidates: List[str]) -> List[str]:
+        """Order/filter competitors using memory block list and reliability."""
+        import os
+
+        profile = self.merchant_profile(merchant_slug)
+        notes = profile.get("behavior_notes") or {}
+        memory_blocked = set(notes.get("blocked_sources") or [])
+        block_counts = self.store.get_block_counts()
+        threshold = int(os.getenv("CRAWLER_DEAD_BLOCK_THRESHOLD", "8"))
+
+        planned: List[str] = []
+        skipped: List[str] = []
+        for name in candidates:
+            if name in memory_blocked:
+                skipped.append(name)
+                continue
+            if block_counts.get(name, 0) >= threshold:
+                skipped.append(name)
+                continue
+            planned.append(name)
+
+        if not planned and candidates:
+            planned = candidates[: max(2, len(candidates) // 2)]
+        return planned
+
     def update_merchant_behavior(
         self,
         merchant_slug: str,
